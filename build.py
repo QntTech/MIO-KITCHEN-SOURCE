@@ -45,9 +45,42 @@ class Builder:
         self.install_package()
         self.unit_test()
         self.patch_libs()
+        self.fix_pywin32()
         self.pyinstaller_build()
         self.config_folder()
         self.pack_zip(f'{self.local}/dist', self.name)
+
+    def fix_pywin32(self):
+        # pywin32 installed via pip needs its post-install step run so that
+        # pywintypes/pythoncom are registered and importable. Without this,
+        # PyInstaller's hook-pythoncom.py fails with:
+        #   ModuleNotFoundError: No module named 'pywintypes'
+        if os.name != 'nt':
+            return
+        print("Fixing pywin32 (running post-install step)")
+        try:
+            import win32com  # noqa: F401
+            import pywintypes  # noqa: F401
+            print("pywin32 already importable, skipping post-install")
+            return
+        except ImportError:
+            pass
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pywin32_postinstall", "-install"],
+                check=True,
+            )
+        except Exception as e:
+            print(f"pywin32_postinstall via -m failed ({e}), trying script path")
+            import site
+            for base in set(site.getsitepackages() + [site.getusersitepackages()]):
+                script = os.path.join(base, "..", "Scripts", "pywin32_postinstall.py")
+                script = os.path.normpath(script)
+                if os.path.exists(script):
+                    subprocess.run([sys.executable, script, "-install"], check=True)
+                    break
+            else:
+                print("Could not locate pywin32_postinstall.py; continuing anyway")
 
     def patch_libs(self):
         print("Patching libs")
