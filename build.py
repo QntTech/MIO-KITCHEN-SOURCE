@@ -52,35 +52,142 @@ class Builder:
 
     def fix_pywin32(self):
         # pywin32 installed via pip needs its post-install step run so that
-        # pywintypes/pythoncom are registered and importable. Without this,
-        # PyInstaller's hook-pythoncom.py fails with:
+        # pywintypes/pythoncom are registered and importable by *any* python
+        # process (including the isolated child processes PyInstaller spawns
+        # to inspect hidden imports). Without this, PyInstaller's
+        # hook-pythoncom.py fails with:
         #   ModuleNotFoundError: No module named 'pywintypes'
         if os.name != 'nt':
             return
         print("Fixing pywin32 (running post-install step)")
+
+        import site
+        import glob
+        site_packages = [p for p in site.getsitepackages() if os.path.isdir(p)]
         try:
-            import win32com  # noqa: F401
-            import pywintypes  # noqa: F401
-            print("pywin32 already importable, skipping post-install")
-            return
-        except ImportError:
+            user_site = site.getusersitepackages()
+            if user_site and os.path.isdir(user_site):
+                site_packages.append(user_site)
+        except Exception:
             pass
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pywin32_postinstall", "-install"],
-                check=True,
-            )
-        except Exception as e:
-            print(f"pywin32_postinstall via -m failed ({e}), trying script path")
-            import site
-            for base in set(site.getsitepackages() + [site.getusersitepackages()]):
-                script = os.path.join(base, "..", "Scripts", "pywin32_postinstall.py")
-                script = os.path.normpath(script)
-                if os.path.exists(script):
-                    subprocess.run([sys.executable, script, "-install"], check=True)
+
+        # 0) Make sure pywin32's own .pth file is actually in place and
+        # correct. This file is what makes every *future* python process
+        # (including PyInstaller's isolated child workers, which inherit
+        # environment but not our sys.path edits) automatically add
+        # win32/win32\lib/pythonwin to sys.path on startup - which is what
+        # ultimately fixes the hook failure, not just this process.
+        pth_content = (
+            "# .pth file for the PyWin32 extensions (restored by build.py)\n"
+            "win32\n"
+            "win32\\lib\n"
+            "pythonwin\n"
+        )
+        for base in site_packages:
+            if os.path.isdir(os.path.join(base, "win32")):
+                pth_path = os.path.join(base, "pywin32.pth")
+                try:
+                    write_it = True
+                    if os.path.exists(pth_path):
+                        with open(pth_path, "r", encoding="utf-8", errors="ignore") as f:
+                            if "win32\\lib" in f.read():
+                                write_it = False
+                    if write_it:
+                        with open(pth_path, "w", encoding="utf-8") as f:
+                            f.write(pth_content)
+                        print(f"Wrote {pth_path}")
+                except Exception as e:
+                    print(f"Could not write pywin32.pth at {pth_path}: {e}")
+
+        # 1) Try the real post-install script, wherever it landed (search
+        # broadly since its location varies by pip/pywin32 version).
+        candidates = []
+        for base in site_packages:
+            candidates.append(os.path.join(base, "win32", "scripts", "pywin32_postinstall.py"))
+            candidates.append(os.path.join(base, "Scripts", "pywin32_postinstall.py"))
+            candidates.append(os.path.normpath(os.path.join(base, "..", "Scripts", "pywin32_postinstall.py")))
+            candidates.extend(glob.glob(os.path.join(base, "pywin32*.data", "scripts", "pywin32_postinstall.py")))
+        # also search near the interpreter (Scripts dir next to python.exe)
+        py_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(py_dir, "Scripts", "pywin32_postinstall.py"))
+
+        ran_postinstall = False
+        for script in candidates:
+            if script and os.path.exists(script):
+                try:
+                    subprocess.run([sys.executable, script, "-install", "-silent"], check=True)
+                    ran_postinstall = True
+                    print(f"Ran pywin32 post-install script: {script}")
                     break
-            else:
-                print("Could not locate pywin32_postinstall.py; continuing anyway")
+                except Exception as e:
+                    print(f"Running {script} failed: {e}")
+        if not ran_postinstall:
+            try:
+                subprocess.run([sys.executable, "-m", "pywin32_postinstall", "-install", "-silent"], check=True)
+                ran_postinstall = True
+            except Exception as e:
+                print(f"pywin32_postinstall via -m failed ({e})")
+
+        # 2) Regardless of the above, make sure the pywin32 extension
+        # directories are on sys.path AND on PATH for this process and any
+        # child processes (PyInstaller's isolated workers included), since
+        # that's what actually lets `import pywintypes` succeed and lets the
+        # loader find the accompanying DLLs. Critically this must include
+        # pywin32_system32, where pythoncomXXX.dll / pywintypesXXX.dll
+        # actually live, and win32/lib, where the pywintypes.py shim lives.
+        pywin32_dirs = []
+        for base in site_packages:
+            for sub in ("win32", os.path.join("win32", "lib"), "win32com", "win32comext",
+                        "pywin32_system32", "Pythonwin"):
+                d = os.path.join(base, sub)
+                if os.path.isdir(d):
+                    pywin32_dirs.append(d)
+
+        for d in pywin32_dirs:
+            if d not in sys.path:
+                sys.path.insert(0, d)
+
+        if pywin32_dirs:
+            os.environ["PATH"] = os.pathsep.join(pywin32_dirs) + os.pathsep + os.environ.get("PATH", "")
+            # Python 3.8+ ignores PATH for DLL resolution unless the
+            # directory is registered explicitly.
+            if hasattr(os, "add_dll_directory"):
+                for d in pywin32_dirs:
+                    try:
+                        os.add_dll_directory(d)
+                    except (OSError, ValueError):
+                        pass
+
+        # 2b) Belt-and-braces: also copy the pywin32 DLLs next to the
+        # interpreter (alongside python.exe). This directory is always on
+        # the DLL search path for every process using this interpreter,
+        # including PyInstaller's isolated child workers, regardless of
+        # PATH/env inheritance quirks.
+        for base in site_packages:
+            dll_dir = os.path.join(base, "pywin32_system32")
+            if os.path.isdir(dll_dir):
+                for dll in glob.glob(os.path.join(dll_dir, "*.dll")):
+                    try:
+                        dest = os.path.join(py_dir, os.path.basename(dll))
+                        if not os.path.exists(dest):
+                            shutil.copy(dll, dest)
+                            print(f"Copied {dll} -> {dest}")
+                    except Exception as e:
+                        print(f"Could not copy {dll}: {e}")
+
+        # 3) Verify in a *fresh subprocess* (not this process). This is the
+        # only reliable way to know whether PyInstaller's own isolated child
+        # workers will be able to import pythoncom/pywintypes too, since
+        # they're fresh interpreters just like this check is.
+        check = subprocess.run(
+            [sys.executable, "-c", "import pywintypes, pythoncom, win32com; print('OK')"],
+            capture_output=True, text=True,
+        )
+        if check.returncode == 0 and "OK" in check.stdout:
+            print("pywin32 is importable from a fresh interpreter, proceeding")
+        else:
+            print(f"WARNING: pywin32 still not importable from a fresh interpreter after fix attempts.\n"
+                  f"stdout: {check.stdout}\nstderr: {check.stderr}")
 
     def patch_libs(self):
         print("Patching libs")
